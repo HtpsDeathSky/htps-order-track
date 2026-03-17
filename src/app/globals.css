@@ -1,26 +1,94 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --page-0: #e5f1ff;
+  --page-1: #d7ebff;
+  --page-2: #f5faff;
+  --panel: rgba(255, 255, 255, 0.84);
+  --panel-strong: rgba(255, 255, 255, 0.96);
+  --line: rgba(70, 102, 141, 0.16);
+  --text: #10233f;
+  --muted: #5e718a;
+  --accent: #3390ec;
+  --accent-strong: #1e6cc4;
+  --accent-soft: rgba(51, 144, 236, 0.12);
+  --danger: #de5a67;
+  --warn: #f0a029;
+  --ok: #1d9b84;
+  --shadow-xl: 0 28px 70px rgba(31, 69, 122, 0.16);
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-background: var(--page-2);
+  --color-foreground: var(--text);
+  --font-sans:
+    "Aptos",
+    "Segoe UI Variable Text",
+    "SF Pro Text",
+    "Microsoft YaHei UI",
+    "PingFang SC",
+    sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top left, rgba(80, 160, 255, 0.22), transparent 28%),
+    radial-gradient(circle at right 18%, rgba(111, 196, 255, 0.18), transparent 24%),
+    linear-gradient(180deg, var(--page-0) 0%, var(--page-1) 28%, var(--page-2) 100%);
+  color: var(--text);
+  font-family: var(--font-sans);
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  content: "";
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.14) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.12) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.4), transparent 72%);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: rgba(51, 144, 236, 0.22);
+  color: var(--text);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(89, 131, 183, 0.28);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
 }
