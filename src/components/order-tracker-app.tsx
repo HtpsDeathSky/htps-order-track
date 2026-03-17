@@ -1,6 +1,6 @@
 "use client";
 
-import { useDeferredValue, useEffect, useEffectEvent, useState } from "react";
+import { useDeferredValue, useEffect, useEffectEvent, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 
 import {
@@ -9,7 +9,10 @@ import {
   getProductInitials,
   getWarrantyStatus,
   normalizeOrderForm,
+  parseBatchOrderLines,
+  parseFlexibleDateInput,
   toOrderForm,
+  type BatchOrderParseResult,
   type OrderFormState,
   type WarrantyTone,
 } from "@/lib/orders";
@@ -17,12 +20,19 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import type { OrderRecord, ProfileRole } from "@/types/database";
 
 type FilterKey = "all" | "warning" | "expired";
-type FormMode = "create" | "edit";
+type ModalMode = "create" | "edit";
+type EntryMode = "single" | "batch";
 type NoticeTone = "error" | "success";
 
 type Notice = {
   tone: NoticeTone;
   text: string;
+};
+
+type OrderModalState = {
+  isOpen: boolean;
+  mode: ModalMode;
+  orderId: string | null;
 };
 
 const FILTER_OPTIONS: Array<{ key: FilterKey; label: string }> = [
@@ -71,12 +81,8 @@ function validateOrderForm(form: OrderFormState) {
     return "商品名称不能为空。";
   }
 
-  if (!normalized.purchase_date || !normalized.warranty_expire_at) {
-    return "请完整填写购买时间和售后到期时间。";
-  }
-
-  if (normalized.warranty_expire_at < normalized.purchase_date) {
-    return "售后到期时间不能早于购买时间。";
+  if (!normalized.warranty_expire_at) {
+    return "请填写有效的售后到期时间，格式支持 yyyy-MM-dd 或 yyyy/MM/dd。";
   }
 
   return null;
@@ -88,12 +94,17 @@ export function OrderTrackerApp() {
   const [session, setSession] = useState<Session | null>(null);
   const [profileRole, setProfileRole] = useState<ProfileRole | null>(null);
   const [orders, setOrders] = useState<OrderRecord[]>([]);
-  const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterKey>("all");
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
-  const [formMode, setFormMode] = useState<FormMode>("create");
+  const [modalState, setModalState] = useState<OrderModalState>({
+    isOpen: false,
+    mode: "create",
+    orderId: null,
+  });
+  const [entryMode, setEntryMode] = useState<EntryMode>("single");
   const [form, setForm] = useState<OrderFormState>(emptyOrderForm());
+  const [batchInput, setBatchInput] = useState("");
   const [authForm, setAuthForm] = useState({ email: "", password: "" });
   const [loadingSession, setLoadingSession] = useState(Boolean(supabase));
   const [loadingOrders, setLoadingOrders] = useState(false);
@@ -101,7 +112,7 @@ export function OrderTrackerApp() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
 
-  const selectedOrder = orders.find((order) => order.id === selectedOrderId) ?? null;
+  const editingOrder = orders.find((order) => order.id === modalState.orderId) ?? null;
   const query = deferredSearch.trim().toLowerCase();
 
   const filteredOrders = orders.filter((order) => {
@@ -136,19 +147,59 @@ export function OrderTrackerApp() {
     }
   }
 
-  function switchToCreateMode() {
-    setFormMode("create");
-    setSelectedOrderId(null);
+  function openCreateModal() {
+    setModalState({
+      isOpen: true,
+      mode: "create",
+      orderId: null,
+    });
+    setEntryMode("single");
     setForm(emptyOrderForm());
+    setBatchInput("");
   }
 
-  function openOrderEditor(order: OrderRecord) {
-    setSelectedOrderId(order.id);
-    setFormMode("edit");
+  function openEditModal(order: OrderRecord) {
+    setModalState({
+      isOpen: true,
+      mode: "edit",
+      orderId: order.id,
+    });
+    setEntryMode("single");
     setForm(toOrderForm(order));
+    setBatchInput("");
   }
 
-  async function loadOrders(focusId?: string | null) {
+  function closeModal() {
+    setModalState((current) => ({
+      ...current,
+      isOpen: false,
+      orderId: null,
+    }));
+    setEntryMode("single");
+    setForm(emptyOrderForm());
+    setBatchInput("");
+  }
+
+  function normalizeSingleDateField(field: "warrantyExpireAt") {
+    setForm((current) => {
+      const parsedDate = parseFlexibleDateInput(current[field]);
+
+      if (!parsedDate) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [field]: parsedDate,
+      };
+    });
+  }
+
+  function collectBatchOrders(): BatchOrderParseResult {
+    return parseBatchOrderLines(batchInput);
+  }
+
+  async function loadOrders() {
     if (!supabase) {
       return;
     }
@@ -158,8 +209,7 @@ export function OrderTrackerApp() {
     const { data, error } = await supabase
       .from("orders")
       .select("*")
-      .order("warranty_expire_at", { ascending: true })
-      .order("purchase_date", { ascending: false });
+      .order("warranty_expire_at", { ascending: true });
 
     setLoadingOrders(false);
 
@@ -170,28 +220,6 @@ export function OrderTrackerApp() {
 
     const nextOrders = (data ?? []) as OrderRecord[];
     setOrders(nextOrders);
-
-    const focusedOrder =
-      nextOrders.find((order) => order.id === focusId) ??
-      nextOrders.find((order) => order.id === selectedOrderId) ??
-      nextOrders[0] ??
-      null;
-
-    if (!focusedOrder) {
-      if (formMode === "edit") {
-        switchToCreateMode();
-      } else {
-        setSelectedOrderId(null);
-      }
-
-      return;
-    }
-
-    setSelectedOrderId(focusedOrder.id);
-
-    if (formMode === "edit") {
-      setForm(toOrderForm(focusedOrder));
-    }
   }
 
   const applySession = useEffectEvent(async (nextSession: Session | null) => {
@@ -200,7 +228,7 @@ export function OrderTrackerApp() {
 
     if (!nextSession) {
       setOrders([]);
-      switchToCreateMode();
+      closeModal();
       setLoadingOrders(false);
       setLoadingSession(false);
       return;
@@ -301,7 +329,7 @@ export function OrderTrackerApp() {
     setNotice({ tone: "success", text: "你已退出登录。" });
   }
 
-  async function handleOrderSubmit(event: React.FormEvent<HTMLFormElement>) {
+  async function handleSingleOrderSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     if (!supabase || !session) {
@@ -319,14 +347,14 @@ export function OrderTrackerApp() {
     setSubmitting(true);
     setNotice(null);
 
-    if (formMode === "edit" && selectedOrder) {
-      const { data, error } = await supabase
+    if (modalState.mode === "edit" && editingOrder) {
+      const { error } = await supabase
         .from("orders")
         .update({
-          user_id: selectedOrder.user_id,
+          user_id: editingOrder.user_id,
           ...payload,
         })
-        .eq("id", selectedOrder.id)
+        .eq("id", editingOrder.id)
         .select("*")
         .single();
 
@@ -337,10 +365,9 @@ export function OrderTrackerApp() {
         return;
       }
 
-      const updatedOrder = data as OrderRecord | null;
-
       setNotice({ tone: "success", text: "订单已更新。" });
-      await loadOrders(updatedOrder?.id ?? selectedOrder.id);
+      closeModal();
+      await loadOrders();
       return;
     }
 
@@ -362,17 +389,62 @@ export function OrderTrackerApp() {
 
     const createdOrder = data as OrderRecord | null;
 
-    setFormMode("edit");
-    setNotice({ tone: "success", text: "订单已创建。" });
-    await loadOrders(createdOrder?.id ?? null);
+    setNotice({ tone: "success", text: `订单已创建：${createdOrder?.product_name ?? payload.product_name}` });
+    closeModal();
+    await loadOrders();
   }
 
-  async function handleDelete() {
-    if (!supabase || !session || !selectedOrder) {
+  async function handleBatchOrderSubmit() {
+    if (!supabase || !session) {
       return;
     }
 
-    const confirmed = window.confirm(`确认删除「${selectedOrder.product_name}」吗？`);
+    const { items, errors } = collectBatchOrders();
+    const normalizedItems: Array<ReturnType<typeof normalizeOrderForm> & { user_id: string }> = [];
+    const validationErrors = [...errors];
+
+    for (const [index, item] of items.entries()) {
+      const validationError = validateOrderForm(item);
+
+      if (validationError) {
+        validationErrors.push(`第 ${index + 1} 行：${validationError}`);
+        continue;
+      }
+
+      normalizedItems.push({
+        user_id: session.user.id,
+        ...normalizeOrderForm(item),
+      });
+    }
+
+    if (validationErrors.length > 0) {
+      setNotice({ tone: "error", text: validationErrors.join(" ") });
+      return;
+    }
+
+    setSubmitting(true);
+    setNotice(null);
+
+    const { error } = await supabase.from("orders").insert(normalizedItems);
+
+    setSubmitting(false);
+
+    if (error) {
+      setNotice({ tone: "error", text: `批量创建失败：${error.message}` });
+      return;
+    }
+
+    setNotice({ tone: "success", text: `已新增 ${normalizedItems.length} 条订单。` });
+    closeModal();
+    await loadOrders();
+  }
+
+  async function handleDelete(order: OrderRecord) {
+    if (!supabase || !session) {
+      return;
+    }
+
+    const confirmed = window.confirm(`确认删除「${order.product_name}」吗？`);
 
     if (!confirmed) {
       return;
@@ -381,10 +453,7 @@ export function OrderTrackerApp() {
     setSubmitting(true);
     setNotice(null);
 
-    const { error } = await supabase
-      .from("orders")
-      .delete()
-      .eq("id", selectedOrder.id);
+    const { error } = await supabase.from("orders").delete().eq("id", order.id);
 
     setSubmitting(false);
 
@@ -393,8 +462,11 @@ export function OrderTrackerApp() {
       return;
     }
 
-    switchToCreateMode();
-    setNotice({ tone: "success", text: "订单已删除。" });
+    if (modalState.orderId === order.id) {
+      closeModal();
+    }
+
+    setNotice({ tone: "success", text: `已删除订单：${order.product_name}` });
     await loadOrders();
   }
 
@@ -491,214 +563,103 @@ export function OrderTrackerApp() {
           />
         </section>
 
-        <section className="grid gap-5 xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
-          <div className="rounded-[32px] border border-white/70 bg-[var(--panel)] p-4 shadow-[var(--shadow-xl)] backdrop-blur-xl sm:p-5">
-            <div className="flex flex-col gap-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
-                    {profileRole === "admin" ? "全部订单" : "我的订单"}
-                  </p>
-                  <h2 className="mt-1 text-xl font-semibold text-slate-900">
-                    到期时间队列
-                  </h2>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    switchToCreateMode();
-                    setNotice(null);
-                  }}
-                  className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[var(--accent-strong)]"
-                >
-                  新建订单
-                </button>
+        <section className="rounded-[32px] border border-white/70 bg-[var(--panel)] p-4 shadow-[var(--shadow-xl)] backdrop-blur-xl sm:p-5">
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+                  {profileRole === "admin" ? "全部订单" : "我的订单"}
+                </p>
+                <h2 className="mt-1 text-xl font-semibold text-slate-900">
+                  到期时间队列
+                </h2>
               </div>
 
-              <div className="rounded-[26px] bg-white/80 p-3 shadow-sm">
-                <div className="flex items-center gap-3 rounded-[20px] border border-slate-200 bg-white px-3 py-2">
-                  <span className="text-sm text-slate-400">⌕</span>
-                  <input
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    placeholder="搜索商品名或备注"
-                    className="w-full bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
-                  />
-                </div>
+              <button
+                type="button"
+                onClick={() => {
+                  openCreateModal();
+                  setNotice(null);
+                }}
+                className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-[var(--accent-strong)]"
+              >
+                新增窗口
+              </button>
+            </div>
 
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {FILTER_OPTIONS.map((option) => (
-                    <button
-                      key={option.key}
-                      type="button"
-                      onClick={() => setFilter(option.key)}
-                      className={cn(
-                        "rounded-full px-3 py-1.5 text-sm font-medium transition",
-                        filter === option.key
-                          ? "bg-slate-900 text-white"
-                          : "bg-slate-100 text-slate-600 hover:bg-slate-200",
-                      )}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
+            <div className="grid gap-3 rounded-[26px] bg-white/80 p-3 shadow-sm lg:grid-cols-[minmax(0,1fr)_auto]">
+              <div className="flex items-center gap-3 rounded-[20px] border border-slate-200 bg-white px-3 py-2">
+                <span className="text-sm text-slate-400">⌕</span>
+                <input
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="搜索商品名或备注"
+                  className="w-full bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
+                />
               </div>
 
-              <div className="space-y-3">
-                {loadingOrders ? (
-                  <div className="rounded-[26px] border border-dashed border-slate-200 bg-white/70 px-4 py-8 text-center text-sm text-slate-500">
-                    正在同步订单...
-                  </div>
-                ) : filteredOrders.length === 0 ? (
-                  <div className="rounded-[26px] border border-dashed border-slate-200 bg-white/70 px-4 py-8 text-center text-sm text-slate-500">
-                    还没有匹配的订单，先创建一条试试。
-                  </div>
-                ) : (
-                  filteredOrders.map((order) => (
-                    <OrderListCard
-                      key={order.id}
-                      isActive={order.id === selectedOrderId}
-                      order={order}
-                      onSelect={() => {
-                        openOrderEditor(order);
-                        setNotice(null);
-                      }}
-                    />
-                  ))
-                )}
+              <div className="flex flex-wrap gap-2">
+                {FILTER_OPTIONS.map((option) => (
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() => setFilter(option.key)}
+                    className={cn(
+                      "rounded-full px-3 py-1.5 text-sm font-medium transition",
+                      filter === option.key
+                        ? "bg-slate-900 text-white"
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
               </div>
             </div>
-          </div>
 
-          <div className="grid gap-5">
-            <OrderDetailCard order={selectedOrder} />
-
-            <section className="rounded-[32px] border border-white/70 bg-[var(--panel)] p-4 shadow-[var(--shadow-xl)] backdrop-blur-xl sm:p-6">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
-                    {formMode === "edit" ? "编辑模式" : "录入模式"}
-                  </p>
-                  <h2 className="mt-1 text-xl font-semibold text-slate-900">
-                    {formMode === "edit" ? "编辑订单信息" : "新增订单"}
-                  </h2>
+            <div className="space-y-3">
+              {loadingOrders ? (
+                <div className="rounded-[26px] border border-dashed border-slate-200 bg-white/70 px-4 py-8 text-center text-sm text-slate-500">
+                  正在同步订单...
                 </div>
-
-                {formMode === "edit" ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      switchToCreateMode();
+              ) : filteredOrders.length === 0 ? (
+                <div className="rounded-[26px] border border-dashed border-slate-200 bg-white/70 px-4 py-8 text-center text-sm text-slate-500">
+                  还没有匹配的订单，点击右上角“新增窗口”开始录入。
+                </div>
+              ) : (
+                filteredOrders.map((order) => (
+                  <OrderListCard
+                    key={order.id}
+                    order={order}
+                    onDelete={() => void handleDelete(order)}
+                    onEdit={() => {
+                      openEditModal(order);
                       setNotice(null);
                     }}
-                    className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
-                  >
-                    切换到新建
-                  </button>
-                ) : null}
-              </div>
-
-              <form className="mt-5 grid gap-4" onSubmit={handleOrderSubmit}>
-                <label className="grid gap-2">
-                  <span className="text-sm font-medium text-slate-700">商品名称</span>
-                  <input
-                    value={form.productName}
-                    onChange={(event) =>
-                      setForm((current) => ({
-                        ...current,
-                        productName: event.target.value,
-                      }))
-                    }
-                    placeholder="例如：iPhone 16 Pro"
-                    className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
                   />
-                </label>
-
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <label className="grid gap-2">
-                    <span className="text-sm font-medium text-slate-700">购买时间</span>
-                    <input
-                      type="date"
-                      value={form.purchaseDate}
-                      onChange={(event) =>
-                        setForm((current) => ({
-                          ...current,
-                          purchaseDate: event.target.value,
-                        }))
-                      }
-                      className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
-                    />
-                  </label>
-
-                  <label className="grid gap-2">
-                    <span className="text-sm font-medium text-slate-700">售后到期时间</span>
-                    <input
-                      type="date"
-                      value={form.warrantyExpireAt}
-                      onChange={(event) =>
-                        setForm((current) => ({
-                          ...current,
-                          warrantyExpireAt: event.target.value,
-                        }))
-                      }
-                      className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
-                    />
-                  </label>
-                </div>
-
-                <label className="grid gap-2">
-                  <span className="text-sm font-medium text-slate-700">备注</span>
-                  <textarea
-                    value={form.note}
-                    onChange={(event) =>
-                      setForm((current) => ({
-                        ...current,
-                        note: event.target.value,
-                      }))
-                    }
-                    rows={4}
-                    placeholder="例如：发票已归档，售后联系人已记录"
-                    className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
-                  />
-                </label>
-
-                <div className="flex flex-col gap-3 pt-2 sm:flex-row sm:justify-between">
-                  <div className="text-sm text-[var(--muted)]">
-                    保存后会立即按售后到期时间重新排序。
-                  </div>
-
-                  <div className="flex flex-col gap-3 sm:flex-row">
-                    {formMode === "edit" && selectedOrder ? (
-                      <button
-                        type="button"
-                        onClick={handleDelete}
-                        disabled={submitting}
-                        className="rounded-full border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-700 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        删除订单
-                      </button>
-                    ) : null}
-
-                    <button
-                      type="submit"
-                      disabled={submitting}
-                      className="rounded-full bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {submitting
-                        ? "正在保存..."
-                        : formMode === "edit"
-                          ? "保存修改"
-                          : "创建订单"}
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </section>
+                ))
+              )}
+            </div>
           </div>
         </section>
       </div>
+
+      {modalState.isOpen ? (
+        <OrderEntryModal
+          batchInput={batchInput}
+          entryMode={entryMode}
+          form={form}
+          isSubmitting={submitting}
+          mode={modalState.mode}
+          onBatchInputChange={setBatchInput}
+          onClose={closeModal}
+          onEntryModeChange={setEntryMode}
+          onFormChange={setForm}
+          onNormalizeDateField={normalizeSingleDateField}
+          onSubmitBatch={() => void handleBatchOrderSubmit()}
+          onSubmitSingle={(event) => void handleSingleOrderSubmit(event)}
+        />
+      ) : null}
     </main>
   );
 }
@@ -748,7 +709,7 @@ function LoginScreen({
               />
               <FeatureCard
                 title="即时录入"
-                detail="购买时间、到期时间和备注统一归档。"
+                detail="到期时间和备注统一归档。"
               />
               <FeatureCard
                 title="轻量部署"
@@ -911,125 +872,350 @@ function FeatureCard({ title, detail }: { title: string; detail: string }) {
 }
 
 function OrderListCard({
-  isActive,
   order,
-  onSelect,
+  onDelete,
+  onEdit,
 }: {
-  isActive: boolean;
   order: OrderRecord;
-  onSelect: () => void;
+  onDelete: () => void;
+  onEdit: () => void;
 }) {
   const status = getWarrantyStatus(order.warranty_expire_at);
   const tone = getToneStyles(status.tone);
 
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      className={cn(
-        "flex w-full items-start gap-3 rounded-[26px] border p-4 text-left transition",
-        isActive
-          ? "border-sky-300 bg-sky-50/90 shadow-sm"
-          : "border-white/70 bg-white/75 hover:border-sky-200 hover:bg-white",
-      )}
-    >
-      <div
-        className={cn(
-          "flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br text-sm font-semibold text-slate-700",
-          tone.accent,
-        )}
-      >
-        {getProductInitials(order.product_name)}
-      </div>
+    <article className="rounded-[26px] border border-white/70 bg-white/75 p-4 shadow-sm transition hover:border-sky-200 hover:bg-white">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
+        <div
+          className={cn(
+            "flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br text-sm font-semibold text-slate-700",
+            tone.accent,
+          )}
+        >
+          {getProductInitials(order.product_name)}
+        </div>
 
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <p className="truncate text-sm font-semibold text-slate-900">
-            {order.product_name}
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="truncate text-sm font-semibold text-slate-900">
+              {order.product_name}
+            </p>
+            <span className={cn("rounded-full px-2 py-1 text-xs font-semibold", tone.badge)}>
+              {status.label}
+            </span>
+          </div>
+
+          <p className="mt-2 text-sm text-[var(--muted)]">
+            售后到期：{formatDateLabel(order.warranty_expire_at)}
           </p>
-          <span className={cn("rounded-full px-2 py-1 text-xs font-semibold", tone.badge)}>
-            {status.label}
-          </span>
+
+          {order.note ? (
+            <p className="mt-3 line-clamp-2 text-sm leading-6 text-slate-600">{order.note}</p>
+          ) : null}
+
+          <div className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-500">
+            <span className={cn("h-2 w-2 rounded-full", tone.dot)} />
+            {status.detail}
+          </div>
         </div>
 
-        <div className="mt-2 flex flex-col gap-1 text-sm text-[var(--muted)]">
-          <p>购买时间：{formatDateLabel(order.purchase_date)}</p>
-          <p>售后到期：{formatDateLabel(order.warranty_expire_at)}</p>
-        </div>
-
-        <div className="mt-3 flex items-center gap-2 text-xs font-medium text-slate-500">
-          <span className={cn("h-2 w-2 rounded-full", tone.dot)} />
-          {status.detail}
+        <div className="flex shrink-0 gap-2 sm:flex-col">
+          <button
+            type="button"
+            onClick={onEdit}
+            className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700"
+          >
+            编辑
+          </button>
+          <button
+            type="button"
+            onClick={onDelete}
+            className="rounded-full border border-rose-200 bg-rose-50 px-4 py-2 text-sm font-medium text-rose-700 transition hover:bg-rose-100"
+          >
+            删除
+          </button>
         </div>
       </div>
-    </button>
+    </article>
   );
 }
 
-function OrderDetailCard({ order }: { order: OrderRecord | null }) {
-  if (!order) {
-    return (
-      <section className="rounded-[32px] border border-white/70 bg-[var(--panel)] p-6 shadow-[var(--shadow-xl)] backdrop-blur-xl">
-        <p className="text-xs uppercase tracking-[0.24em] text-slate-500">订单详情</p>
-        <h2 className="mt-2 text-2xl font-semibold text-slate-900">请选择一条订单</h2>
-        <p className="mt-3 text-sm leading-7 text-[var(--muted)]">
-          选择左侧列表中的任意订单，可以查看更详细的信息并直接修改内容。
-        </p>
+function OrderEntryModal({
+  batchInput,
+  entryMode,
+  form,
+  isSubmitting,
+  mode,
+  onBatchInputChange,
+  onClose,
+  onEntryModeChange,
+  onFormChange,
+  onNormalizeDateField,
+  onSubmitBatch,
+  onSubmitSingle,
+}: {
+  batchInput: string;
+  entryMode: EntryMode;
+  form: OrderFormState;
+  isSubmitting: boolean;
+  mode: ModalMode;
+  onBatchInputChange: (value: string) => void;
+  onClose: () => void;
+  onEntryModeChange: (value: EntryMode) => void;
+  onFormChange: (value: OrderFormState) => void;
+  onNormalizeDateField: (field: "warrantyExpireAt") => void;
+  onSubmitBatch: () => void;
+  onSubmitSingle: (event: React.FormEvent<HTMLFormElement>) => void;
+}) {
+  const isCreate = mode === "create";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-4 py-6 sm:px-6">
+      <button
+        aria-label="关闭录入窗口"
+        className="absolute inset-0 bg-slate-950/26 backdrop-blur-[2px]"
+        onClick={onClose}
+        type="button"
+      />
+
+      <section className="relative z-10 max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-[36px] border border-white/70 bg-[var(--panel-strong)] p-5 shadow-[var(--shadow-xl)] backdrop-blur-xl sm:p-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">
+              {isCreate ? "新增窗口" : "编辑窗口"}
+            </p>
+            <h2 className="mt-1 text-2xl font-semibold text-slate-900">
+              {isCreate ? "录入订单" : "修改订单"}
+            </h2>
+            <p className="mt-2 text-sm leading-7 text-[var(--muted)]">
+              日期支持组件选择，也支持直接输入 `yyyy-MM-dd` 或 `yyyy/MM/dd`。
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
+          >
+            关闭
+          </button>
+        </div>
+
+        {isCreate ? (
+          <div className="mt-5 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => onEntryModeChange("single")}
+              className={cn(
+                "rounded-full px-4 py-2 text-sm font-medium transition",
+                entryMode === "single"
+                  ? "bg-slate-900 text-white"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+              )}
+            >
+              单条录入
+            </button>
+            <button
+              type="button"
+              onClick={() => onEntryModeChange("batch")}
+              className={cn(
+                "rounded-full px-4 py-2 text-sm font-medium transition",
+                entryMode === "batch"
+                  ? "bg-slate-900 text-white"
+                  : "bg-slate-100 text-slate-600 hover:bg-slate-200",
+              )}
+            >
+              多行录入
+            </button>
+          </div>
+        ) : null}
+
+        {mode === "edit" || entryMode === "single" ? (
+          <form className="mt-5 grid gap-4" onSubmit={onSubmitSingle}>
+            <label className="grid gap-2">
+              <span className="text-sm font-medium text-slate-700">商品名称</span>
+              <input
+                value={form.productName}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    productName: event.target.value,
+                  })
+                }
+                placeholder="例如：iPhone 16 Pro"
+                className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
+              />
+            </label>
+
+            <FlexibleDateField
+              label="售后到期时间"
+              value={form.warrantyExpireAt}
+              onBlurNormalize={() => onNormalizeDateField("warrantyExpireAt")}
+              onChange={(value) =>
+                onFormChange({
+                  ...form,
+                  warrantyExpireAt: value,
+                })
+              }
+            />
+
+            <label className="grid gap-2">
+              <span className="text-sm font-medium text-slate-700">备注</span>
+              <textarea
+                value={form.note}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    note: event.target.value,
+                  })
+                }
+                rows={4}
+                placeholder="例如：发票已归档，售后联系人已记录"
+                className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
+              />
+            </label>
+
+            <div className="flex flex-col gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-[var(--muted)]">
+                保存后会立即按售后到期时间重新排序。
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSubmitting}
+                className="rounded-full bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSubmitting ? "正在保存..." : mode === "edit" ? "保存修改" : "创建订单"}
+              </button>
+            </div>
+          </form>
+        ) : (
+          <section className="mt-5 grid gap-4">
+            <div className="rounded-[24px] bg-sky-50/80 p-4 text-sm leading-7 text-slate-600">
+              <p className="font-medium text-slate-900">每行一条订单，推荐格式：</p>
+              <p className="mt-2 font-mono text-xs text-slate-700">
+                商品名称 | 售后到期时间 | 备注
+              </p>
+              <p className="mt-2 font-mono text-xs text-slate-700">
+                MacBook Air | 2027/03/01 | 教研室设备
+              </p>
+              <p className="mt-1 font-mono text-xs text-slate-700">
+                AirPods Pro | 2027-03-02
+              </p>
+            </div>
+
+            <label className="grid gap-2">
+              <span className="text-sm font-medium text-slate-700">多行录入内容</span>
+              <textarea
+                value={batchInput}
+                onChange={(event) => onBatchInputChange(event.target.value)}
+                rows={10}
+                placeholder="一行一条，支持 |、Tab 或逗号分隔。"
+                className="rounded-[18px] border border-slate-200 bg-white px-4 py-3 font-mono text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
+              />
+            </label>
+
+            <div className="flex flex-col gap-3 pt-2 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-[var(--muted)]">
+                日期支持 `yyyy-MM-dd` 和 `yyyy/MM/dd` 两种格式。
+              </div>
+
+              <button
+                type="button"
+                onClick={onSubmitBatch}
+                disabled={isSubmitting}
+                className="rounded-full bg-slate-900 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSubmitting ? "正在创建..." : "批量创建"}
+              </button>
+            </div>
+          </section>
+        )}
       </section>
-    );
+    </div>
+  );
+}
+
+function FlexibleDateField({
+  label,
+  value,
+  onBlurNormalize,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onBlurNormalize: () => void;
+  onChange: (value: string) => void;
+}) {
+  const pickerValue = parseFlexibleDateInput(value) ?? "";
+  const pickerRef = useRef<HTMLInputElement>(null);
+
+  function openPicker() {
+    const pickerInput = pickerRef.current as (HTMLInputElement & { showPicker?: () => void }) | null;
+
+    if (!pickerInput) {
+      return;
+    }
+
+    if (typeof pickerInput.showPicker === "function") {
+      try {
+        pickerInput.showPicker();
+        return;
+      } catch {
+        // Fall through to click-based picker opening for browsers that block showPicker().
+      }
+    }
+
+    pickerInput.focus();
+    pickerInput.click();
   }
 
-  const status = getWarrantyStatus(order.warranty_expire_at);
-  const tone = getToneStyles(status.tone);
-
   return (
-    <section className="rounded-[32px] border border-white/70 bg-[var(--panel)] p-5 shadow-[var(--shadow-xl)] backdrop-blur-xl sm:p-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <div className="flex items-start gap-4">
-          <div
-            className={cn(
-              "flex h-14 w-14 items-center justify-center rounded-[22px] bg-gradient-to-br text-base font-semibold text-slate-700",
-              tone.accent,
-            )}
+    <label className="grid gap-2">
+      <span className="text-sm font-medium text-slate-700">{label}</span>
+      <div className="relative">
+        <input
+          type="text"
+          value={value}
+          onBlur={onBlurNormalize}
+          onChange={(event) => onChange(event.target.value)}
+          inputMode="numeric"
+          autoComplete="off"
+          placeholder="yyyy-MM-dd 或 yyyy/MM/dd"
+          className="w-full rounded-[18px] border border-slate-200 bg-white px-4 py-3 pr-14 text-sm text-slate-900 outline-none transition focus:border-sky-400 focus:ring-4 focus:ring-sky-100"
+        />
+        <input
+          ref={pickerRef}
+          type="date"
+          value={pickerValue}
+          onChange={(event) => onChange(event.target.value)}
+          tabIndex={-1}
+          aria-hidden="true"
+          className="pointer-events-none absolute right-2 top-1/2 h-10 w-10 -translate-y-1/2 opacity-0"
+        />
+        <button
+          type="button"
+          aria-label={`选择${label}`}
+          onClick={openPicker}
+          className="absolute right-2 top-1/2 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-slate-500 transition hover:border-sky-200 hover:bg-sky-50 hover:text-sky-700"
+        >
+          <svg
+            aria-hidden="true"
+            className="h-4 w-4"
+            fill="none"
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth="1.8"
+            viewBox="0 0 24 24"
           >
-            {getProductInitials(order.product_name)}
-          </div>
-
-          <div>
-            <p className="text-xs uppercase tracking-[0.24em] text-slate-500">订单详情</p>
-            <h2 className="mt-1 text-2xl font-semibold text-slate-900">
-              {order.product_name}
-            </h2>
-            <p className="mt-2 text-sm text-[var(--muted)]">{status.detail}</p>
-          </div>
-        </div>
-
-        <span className={cn("rounded-full px-3 py-1.5 text-sm font-semibold", tone.badge)}>
-          {status.label}
-        </span>
+            <path d="M8 2v4" />
+            <path d="M16 2v4" />
+            <path d="M3 10h18" />
+            <rect height="18" rx="3" width="18" x="3" y="4" />
+          </svg>
+        </button>
       </div>
-
-      <div className="mt-6 grid gap-3 sm:grid-cols-3">
-        <DetailTile label="购买时间" value={formatDateLabel(order.purchase_date)} />
-        <DetailTile label="售后到期" value={formatDateLabel(order.warranty_expire_at)} />
-        <DetailTile label="最后更新" value={formatDateLabel(order.updated_at.slice(0, 10))} />
-      </div>
-
-      <div className="mt-4 rounded-[24px] bg-white/75 p-4 shadow-sm">
-        <p className="text-xs uppercase tracking-[0.24em] text-slate-500">备注</p>
-        <p className="mt-2 whitespace-pre-wrap text-sm leading-7 text-slate-700">
-          {order.note || "暂无备注"}
-        </p>
-      </div>
-    </section>
-  );
-}
-
-function DetailTile({ label, value }: { label: string; value: string }) {
-  return (
-    <article className="rounded-[24px] bg-white/75 p-4 shadow-sm">
-      <p className="text-xs uppercase tracking-[0.22em] text-slate-500">{label}</p>
-      <p className="mt-2 text-sm font-medium text-slate-900">{value}</p>
-    </article>
+    </label>
   );
 }

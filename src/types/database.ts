@@ -8,31 +8,22 @@ export type Database = {
           id: string;
           user_id: string;
           product_name: string;
-          purchase_date: string;
           warranty_expire_at: string;
           note: string;
-          created_at: string;
-          updated_at: string;
         };
         Insert: {
           id?: string;
           user_id: string;
           product_name: string;
-          purchase_date: string;
           warranty_expire_at: string;
           note?: string;
-          created_at?: string;
-          updated_at?: string;
         };
         Update: {
           id?: string;
           user_id?: string;
           product_name?: string;
-          purchase_date?: string;
           warranty_expire_at?: string;
           note?: string;
-          created_at?: string;
-          updated_at?: string;
         };
         Relationships: [];
       };
